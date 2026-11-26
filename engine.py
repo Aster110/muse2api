@@ -316,6 +316,8 @@ class MuseEngine:
         self.proc: subprocess.Popen | None = None
         self.browser: CDP | None = None
         self._local = threading.local()
+        self._warm_pages = {}
+        self._warm_lock = threading.Lock()
         self._start_lock = threading.Lock()
         self._active_contexts: set[str] = set()
         self._contexts_lock = threading.Lock()
@@ -418,6 +420,10 @@ class MuseEngine:
     def stop(self):
         with self._start_lock:
             self._close_page()
+            with self._warm_lock:
+                for aid in list(self._warm_pages):
+                    self._attach_warm_page(aid)
+                    self._close_page()
             if self.browser:
                 with self._contexts_lock:
                     for ctx_id in list(self._active_contexts):
@@ -639,6 +645,7 @@ class MuseEngine:
                         if verify.status_code == 200:
                             verified_session = verify.json()
                             if isinstance(verified_session, dict) and verified_session.get("status") == "assigned":
+                                sj = {**sj, **verified_session}
                                 vm_state = verified_session.get("vm_state") or vm_state
                                 wake_ok = vm_state == "RUNNING"
                 except MuseProxyError:
@@ -654,6 +661,8 @@ class MuseEngine:
                 "status": sj.get("status"),
                 "vm_id": vm_id,
                 "vm_state": vm_state,
+                "vm_type": sj.get("vm_type"),
+                "cvm_state": (sj.get("cvm_eligibility") or {}).get("state") if isinstance(sj.get("cvm_eligibility"), dict) else None,
                 "wake_ok": wake_ok,
                 "wake_requested": wake_requested,
                 "cookies": cur_cookies,
@@ -841,6 +850,7 @@ class MuseEngine:
         page = self._open_page(proxy=proxy) if proxy else self._open_page()
         self.page = page  # Cleanup must also own pages that never become ready.
         self._ensure_local().proxy_config = proxy
+        local.cookie_baseline = dict(cookies)
         self._apply_cookies(page, cookies, expires)
         page.send("Page.navigate", {"url": "https://muse.ai/thread/new"})
         if self._wait_ws_ready(page, timeout=self.cfg.login_wait):
@@ -860,6 +870,69 @@ class MuseEngine:
             raise MuseAuthError("会话已被 muse.ai 登出（可能被其它登录挤掉或触发风控），"
                                 "请用浏览器扩展重新导入 cookie")
         raise MuseGenerationError("muse.ai 页面加载超时（未出现聊天输入框），请检查服务器网络后重试；未确认会话失效")
+
+    _page_fields = ("page", "current_context_id", "current_acc_id", "proxy_relay",
+                    "proxy_config", "download_dir", "cookie_baseline")
+
+    def _attach_warm_page(self, aid):
+        state = self._warm_pages.pop(aid, {})
+        self._ensure_local().__dict__.update(state)
+
+    def take_warm_page(self, aid):
+        with self._warm_lock:
+            self._attach_warm_page(aid)
+
+    def park_warm_page(self, aid):
+        if not self.page or self.current_acc_id != aid:
+            return
+        local = self._ensure_local().__dict__
+        with self._warm_lock:
+            self._warm_pages[aid] = {k: local.pop(k) for k in self._page_fields if k in local}
+
+    def discard_warm_page(self, aid):
+        with self._warm_lock:
+            if aid not in self._warm_pages:
+                return
+            self._attach_warm_page(aid)
+        self._close_page()
+
+    def clean_chat_page(self):
+        page = self.page
+        empty = """location.pathname === '/thread/new' &&
+            !!document.querySelector('textarea:not(:disabled)') &&
+            !document.querySelector('textarea').value &&
+            !document.querySelector('div[class*="hatch-chat-groupable-bubble"],[data-testid^="hatch-chat-attachment-presentation-"],[data-testid="hatch-composer-stop-button"]')"""
+        if page.js(empty) is True:
+            return
+        clicked = page.js("""(() => {
+            const link = document.querySelector('a[href="/thread/new"]');
+            if (link) {
+                link.click();
+                return true;
+            }
+            if (window.next?.router?.push) {
+                window.next.router.push('/thread/new');
+                return true;
+            }
+            const switcher = document.querySelector('[data-testid="hatch-chat-switcher-trigger"]');
+            if (switcher) switcher.click();
+            return !!switcher;
+        })()""")
+        if clicked is True:
+            until = time.monotonic() + 2
+            while time.monotonic() < until:
+                if page.js(empty) is True:
+                    return
+                page.js("""(() => {
+                    const options = document.querySelectorAll('[role="menuitem"],button,a,[role="option"]');
+                    const add = Array.from(options).find(el =>
+                        /^(new chat|start a new chat|new conversation)$/i.test((el.innerText || el.ariaLabel || '').trim()));
+                    if (add) add.click();
+                })()""")
+                time.sleep(.05)
+        page.send("Page.navigate", {"url": "https://muse.ai/thread/new"})
+        if not self._wait_ws_ready(page, timeout=12) or page.js(empty) is not True:
+            raise MuseGenerationError("未能建立独立的新对话")
 
     def close_current_page(self):
         """显式释放当前线程所持有的页面和隔离上下文。"""
@@ -1195,6 +1268,32 @@ class MuseEngine:
                     pass
         time.sleep(0.3)
         return clicked
+
+    def _send_warm_chat(self, prompt):
+        filled = self.page.js("""((text) => {
+            const box = document.querySelector('textarea:not(:disabled)');
+            if (!box) return false;
+            box.focus();
+            Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(box, text);
+            box.dispatchEvent(new Event('input', {bubbles: true}));
+            return box.value === text;
+        })(%s)""" % json.dumps(prompt))
+        if filled is not True:
+            return False
+        for _ in range(5):
+            if self._click_send() == "clicked":
+                return True
+            time.sleep(.04)
+        if self.page.js("document.querySelector('textarea')?.value") != prompt:
+            raise MuseGenerationError("对话输入框状态已变化，无法确认发送")
+        for kind in ("keyDown", "keyUp"):
+            self.page.send("Input.dispatchKeyEvent", {"type": kind, "key": "Enter", "code": "Enter",
+                                                      "windowsVirtualKeyCode": 13, "nativeVirtualKeyCode": 13})
+        for _ in range(15):
+            if self.page.js("document.querySelector('textarea')?.value") == "":
+                return True
+            time.sleep(.05)
+        raise MuseGenerationError("输入框未确认发送对话")
 
     def _composer_unsent(self) -> str:
         """输入框里还留着什么（没发出去的附件 / 文字）；空串 = 输入框是空的。读不到时按空处理（不误判）。"""
@@ -1560,10 +1659,21 @@ class MuseEngine:
                     stop_event=None):
         """发一条消息，流式 yield 增量文本。"""
         timeout = int(timeout or getattr(self.cfg, "chat_timeout", 300))
+        prepared_at = time.monotonic()
+        warm = getattr(self.cfg, "warm_chat", False) and account_id
         self.ensure_page(cookies, expires, account_id=account_id)
-        self.reset_thread(for_chat=True)
+        if warm:
+            try:
+                self.clean_chat_page()
+            except Exception:
+                self.close_current_page()
+                self.ensure_page(cookies, expires, account_id=account_id)
+                self.clean_chat_page()
+        else:
+            self.reset_thread(for_chat=True)
         base_agent, base_text, _ = self._poll_chat()
-        self._send(prompt)
+        if not (warm and self._send_warm_chat(prompt)):
+            self._send(prompt)
 
         t_sent = time.time()
         deadline = t_sent + timeout
@@ -1590,6 +1700,9 @@ class MuseEngine:
             delta = cur[len(sent):] if cur.startswith(sent) else cur
             if delta:
                 sent = cur
+                if warm:
+                    upstream_s = time.time() - t_sent
+                    log.info("warm chat first content: submit=%.3fs wait=%.3fs", time.monotonic() - prepared_at - upstream_s, upstream_s)
                 yield delta
                 last = cur
                 got_first = True

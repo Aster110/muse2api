@@ -27,7 +27,7 @@ from typing import Any
 
 import asyncio
 import copy
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import base64
 import collections
 import binascii
@@ -38,6 +38,7 @@ import logging
 import os
 import re
 import threading
+import subprocess
 import time
 import uuid
 import zipfile
@@ -138,11 +139,13 @@ class AccountPoolManager:
     def __init__(self, store_instance):
         self.store = store_instance
         self.busy_accounts: set[str] = set()
+        self.session_locks = collections.defaultdict(threading.Lock)
+        self.media_counts = collections.Counter()
         self.cond = threading.Condition()
 
     def acquire(self, account_id: str | None = None, preferred_id: str | None = None,
                 rotate: bool = True, force_rotate: bool = False,
-                timeout: float | None = 60.0, record_use: bool = True) -> dict:
+                timeout: float | None = 60.0, record_use: bool = True, media: bool = False) -> dict:
         deadline = None if timeout is None else time.monotonic() + timeout
         with self.cond:
             while True:
@@ -150,25 +153,31 @@ class AccountPoolManager:
                 if remaining is not None and remaining <= 0:
                     raise MuseGenerationError("等待空闲账号超时，当前所有账号均处于繁忙中")
 
+                blocked = self.busy_accounts | {
+                    aid for aid, count in self.media_counts.items()
+                    if not media or count >= CFG.media_per_account
+                }
                 if account_id:
                     acc = self.store.get_account(account_id)
                     if not acc or not acc.get("enabled", True):
                         raise MuseAuthError(f"指定账号 {account_id} 不存在或已禁用")
-                    if account_id not in self.busy_accounts:
-                        self.busy_accounts.add(account_id)
-                        return acc
+                    if account_id in blocked:
+                        acc = None
                 else:
-                    pref = preferred_id if preferred_id not in self.busy_accounts else None
+                    pref = preferred_id if preferred_id not in blocked else None
                     acc = self.store.pick_account(
                         preferred_id=pref,
                         rotate=rotate,
                         force_rotate=force_rotate,
-                        exclude_ids=self.busy_accounts,
+                        exclude_ids=blocked,
                         record_use=record_use,
                     )
-                    if acc:
+                if acc:
+                    if media:
+                        self.media_counts[acc["id"]] += 1
+                    else:
                         self.busy_accounts.add(acc["id"])
-                        return acc
+                    return acc
 
                 live = [a for a in self.store.accounts if a.get("enabled", True) and a.get("cookies")]
                 if not live:
@@ -176,11 +185,16 @@ class AccountPoolManager:
 
                 self.cond.wait(timeout=0.5 if remaining is None else min(remaining, 0.5))
 
-    def release(self, account_id: str | None):
+    def release(self, account_id: str | None, media: bool = False):
         if not account_id:
             return
         with self.cond:
-            self.busy_accounts.discard(account_id)
+            if media:
+                self.media_counts[account_id] -= 1
+                if self.media_counts[account_id] <= 0:
+                    del self.media_counts[account_id]
+            else:
+                self.busy_accounts.discard(account_id)
             self.cond.notify_all()
 
 
@@ -219,7 +233,7 @@ def _account_operation(aid: str):
         account = store.get_account(aid)
         if not account:
             raise HTTPException(404, "账号不存在")
-        if aid in ACCOUNT_POOL.busy_accounts:
+        if aid in ACCOUNT_POOL.busy_accounts or aid in ACCOUNT_POOL.media_counts:
             raise HTTPException(409, "账号正在执行任务或检测，请稍后再试")
         ACCOUNT_POOL.busy_accounts.add(aid)
         account = copy.deepcopy(account)
@@ -353,6 +367,11 @@ engine.cookie_sink = _persist_session_cookies
 
 
 def _renew_and_persist(acc_id: str, wake_vm: bool = True, force: bool = False) -> dict | None:
+    with ACCOUNT_POOL.session_locks[acc_id]:
+        return _renew_session(acc_id, wake_vm, force)
+
+
+def _renew_session(acc_id, wake_vm, force):
     """调用 /api/session 续签账号 cookie 并写回 store，返回最新账号 dict。
     近期（10分钟内）已续签且状态正常的账号直接复用，避免每次请求阻塞 2~3 秒 HTTP 往返。"""
     acc = store.get_account(acc_id)
@@ -400,6 +419,14 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
     q = queue.Queue(maxsize=100)
     stop_event = threading.Event()
 
+    def emit(kind, value):
+        while not stop_event.is_set():
+            try:
+                q.put((kind, value), timeout=.2)
+                return
+            except queue.Full:
+                continue
+
     def worker():
         cur_id = account_id
         cur_cookies = cookies
@@ -410,7 +437,7 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
         try:
             slot_acquired = GEN_LOCK.acquire(timeout=timeout)
             if not slot_acquired:
-                q.put(("error", MuseGenerationError("等待对话并发槽位超时")))
+                emit("error", MuseGenerationError("等待对话并发槽位超时"))
                 return
             for attempt in range(2):
                 if stop_event.is_set():
@@ -447,17 +474,28 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                     if stop_event.is_set():
                         return
                     engine.start()
+                    if CFG.warm_chat and cur_id:
+                        engine.take_warm_page(cur_id)
                     for chunk in engine.chat_stream(
                         cur_cookies, prompt, cur_exp, timeout,
                         account_id=cur_id, stop_event=stop_event
                     ):
                         yielded = True
-                        q.put(("data", chunk))
+                        emit("data", chunk)
                         if stop_event.is_set():
                             return
                     if cur_id:
                         store.mark(cur_id, True, "")
                         _sync_cookies(cur_id)
+                        if CFG.warm_chat and not stop_event.is_set():
+                            try:
+                                engine.clean_chat_page()
+                                with ACCOUNT_POOL.cond:
+                                    account = store.get_account(cur_id)
+                                    if account and account.get("enabled", True):
+                                        engine.park_warm_page(cur_id)
+                            except Exception as exc:
+                                log.warning("丢弃对话热页 %s: %s", cur_id, type(exc).__name__)
                     return
                 except MuseAuthError as exc:
                     last_exc = exc
@@ -469,15 +507,18 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                 except Exception as exc:
                     last_exc = exc
                     try:
-                        engine.reset_thread()
+                        if CFG.warm_chat:
+                            engine.close_current_page()
+                        else:
+                            engine.reset_thread()
                     except Exception:
                         pass
                     if yielded:
                         break
             if last_exc is not None:
-                q.put(("error", last_exc))
+                emit("error", last_exc)
         except Exception as exc:
-            q.put(("error", exc))
+            emit("error", exc)
         finally:
             try:
                 if leased_id:
@@ -491,7 +532,7 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                 finally:
                     if slot_acquired:
                         GEN_LOCK.release()
-                    q.put(("done", None))
+                    emit("done", None)
 
     threading.Thread(target=worker, daemon=True).start()
 
@@ -1102,22 +1143,29 @@ def _sync_cookies(acc_id: str) -> dict:
         live = engine.read_cookies()
         if not live:
             return {"synced": 0}
-        acc = store.get_account(acc_id)
-        if not acc:
-            return {"synced": 0}
-        cur = dict(acc.get("cookies") or {})
-        new_vals = {k: v["value"] for k, v in live.items() if v.get("value")}
-        # 有效期要「合并」而不是「覆盖」：会话 cookie 读回的 expires 是 -1，
-        # 若整体覆盖会把原有有效期记录清空（实测踩过这个坑）。
-        exps = dict(acc.get("cookies_exp") or {})
-        exps.update({k: v["expires"] for k, v in live.items()
-                     if _pos(v.get("expires"))})
-        changed = sum(1 for k, v in new_vals.items() if cur.get(k) != v)
-        store.update_account(acc_id, cookies={**cur, **new_vals},
-                             cookies_exp=exps, synced_at=int(time.time()))
-        updated = store.get_account(acc_id) or {}
-        return {"synced": len(new_vals), "changed": changed,
-                "expires_at": updated.get("expires_at")}
+        with ACCOUNT_POOL.session_locks[acc_id]:
+            acc = store.get_account(acc_id)
+            if not acc:
+                return {"synced": 0}
+            cur = dict(acc.get("cookies") or {})
+            new_vals = {k: v["value"] for k, v in live.items() if v.get("value")}
+            if CFG.warm_chat or CFG.media_per_account > 1:
+                baseline = getattr(engine._ensure_local(), "cookie_baseline", {})
+                accepted = {k for k in new_vals if cur.get(k) in (baseline.get(k), new_vals[k])}
+                baseline.update(new_vals)
+                new_vals = {k: new_vals[k] for k in accepted}
+                live = {k: live[k] for k in accepted}
+            # 有效期要「合并」而不是「覆盖」：会话 cookie 读回的 expires 是 -1，
+            # 若整体覆盖会把原有有效期记录清空（实测踩过这个坑）。
+            exps = dict(acc.get("cookies_exp") or {})
+            exps.update({k: v["expires"] for k, v in live.items()
+                         if _pos(v.get("expires"))})
+            changed = sum(1 for k, v in new_vals.items() if cur.get(k) != v)
+            store.update_account(acc_id, cookies={**cur, **new_vals},
+                                 cookies_exp=exps, synced_at=int(time.time()))
+            updated = store.get_account(acc_id) or {}
+            return {"synced": len(new_vals), "changed": changed,
+                    "expires_at": updated.get("expires_at")}
     except Exception as exc:  # noqa: BLE001
         log.warning("cookie 同步失败（不影响本次生成）: %s", exc)
         return {"synced": 0, "error": str(exc)[:200]}
@@ -1176,7 +1224,7 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
         remaining = max(0.001, queue_timeout - queued) if queue_timeout else None
         t0 = time.monotonic()
         try:
-            return ACCOUNT_POOL.acquire(timeout=remaining, **kwargs)
+            return ACCOUNT_POOL.acquire(timeout=remaining, media=True, **kwargs)
         finally:
             waited = time.monotonic() - t0
             queued += waited
@@ -1201,7 +1249,7 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
             if attempt > 0:
                 old_id = cur_acc["id"] if cur_acc else None
                 if old_id:
-                    ACCOUNT_POOL.release(old_id)
+                    ACCOUNT_POOL.release(old_id, media=True)
                 cur_acc = None
                 try:
                     alt = lease(rotate=True, force_rotate=True)
@@ -1256,7 +1304,7 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
         raise last_exc
     finally:
         if cur_acc:
-            ACCOUNT_POOL.release(cur_acc.get("id"))
+            ACCOUNT_POOL.release(cur_acc.get("id"), media=True)
         engine.close_current_page()
         _clear_account_proxy()
 
@@ -2015,7 +2063,7 @@ def patch_account(aid: str, req: AccountPatch, _=Depends(auth)):
             raise HTTPException(404, "账号不存在")
         changes = {"label": req.label, "enabled": req.enabled}
         if "proxy" in req.model_fields_set:
-            if aid in ACCOUNT_POOL.busy_accounts:
+            if aid in ACCOUNT_POOL.busy_accounts or aid in ACCOUNT_POOL.media_counts:
                 raise HTTPException(409, "账号正在执行任务或检测，请稍后再修改代理")
             proxy = req.proxy.configuration(existing.get("proxy")) if req.proxy else {}
             if proxy != (existing.get("proxy") or {}):
@@ -2030,6 +2078,8 @@ def patch_account(aid: str, req: AccountPatch, _=Depends(auth)):
                 engine._last_http_renew.pop(aid, None)
             _PROXY_TEST_RECEIPTS.pop(aid, None)
         acc = store.update_account(aid, **changes)
+        if CFG.warm_chat and (changes.get("proxy") is not None or changes.get("enabled") is False):
+            engine.discard_warm_page(aid)
         return store.public_account(acc)
 
 
@@ -2087,7 +2137,12 @@ def test_account_proxy(aid: str, req: ProxyTestRequest | None = None, _=Depends(
 
 @app.delete("/admin/accounts/{aid}")
 def del_account(aid: str, _=Depends(auth)):
-    ok = store.delete_account(aid)
+    if CFG.warm_chat:
+        with _account_operation(aid):
+            engine.discard_warm_page(aid)
+            ok = store.delete_account(aid)
+    else:
+        ok = store.delete_account(aid)
     if not ok:
         raise HTTPException(404, "账号不存在")
     with ACCOUNT_POOL.cond:
@@ -2157,10 +2212,12 @@ def update_cookies(aid: str, payload: dict = Body(...), _=Depends(auth)):
            if _pos(v)}
     # 补入的是「全新会话」的 cookie，有效期估算锚点必须重置到当下，
     # 否则会沿用旧会话的锚点，把剩余天数算少。
-    acc = store.update_account(aid, cookies=cookies, ok=None,
-                               note="已更新 cookie",
-                               expiry_anchor=int(time.time()),
-                               cookies_exp=exp or None)
+    with (_account_operation(aid) if CFG.warm_chat or CFG.media_per_account > 1 else nullcontext()):
+        if CFG.warm_chat:
+            engine.discard_warm_page(aid)
+        acc = store.update_account(aid, cookies=cookies, ok=None,
+                                   note="已更新 cookie", expiry_anchor=int(time.time()),
+                                   cookies_exp=exp or None)
     if not acc:
         raise HTTPException(404, "账号不存在")
     return {"ok": True, "id": aid, "cookie_count": len(cookies),
@@ -2447,6 +2504,37 @@ KEEPALIVE_STATE = {
 }
 
 
+def _observe_vm(aid, session):
+    if not CFG.vm_watch:
+        return
+    acc = store.get_account(aid)
+    previous = acc.get("vm_profile", {})
+    profile = dict(previous)
+    for field in ("vm_type", "cvm_state"):
+        value = session.get(field)
+        if isinstance(value, str) and value:
+            profile[field] = value
+    if not profile:
+        return
+    pending = list(acc.get("vm_notifications", []))
+    if any(key in previous and previous[key] != value for key, value in profile.items()):
+        event = {"account": aid, "before": previous, "after": profile, "at": int(time.time())}
+        pending.append(event)
+        log.warning("VM profile changed: %s", json.dumps(event, ensure_ascii=False))
+    store.update_account(aid, vm_profile=profile, vm_observed_at=int(time.time()), vm_notifications=pending)
+    if CFG.vm_notify:
+        while pending:
+            try:
+                subprocess.run([CFG.vm_notify], input=json.dumps(pending[0]) + "\n",
+                               text=True, timeout=12, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, check=True)
+            except (OSError, subprocess.SubprocessError) as exc:
+                log.warning("VM 通知待重试 %s: %s", aid, type(exc).__name__)
+                break
+            pending = pending[1:]
+            store.update_account(aid, vm_notifications=pending)
+
+
 def _probe_account_sync(aid: str, check_quota: bool = False) -> dict:
     """Verify the upstream session through this account's saved route."""
     try:
@@ -2462,6 +2550,7 @@ def _probe_account_sync(aid: str, check_quota: bool = False) -> dict:
                 ok=True if res.get("ok") else False,
                 synced_at=int(time.time()),
             )
+            _observe_vm(aid, res)
             vm_state = res.get("vm_state") or "RUNNING"
             store.touch_keepalive(aid, True, f"会话有效 · 自动保活 (VM: {vm_state})")
             quota = acc.get("quota")
@@ -2523,6 +2612,7 @@ async def run_keepalive_all(force: bool = False) -> dict:
 
                 needs_run = (
                     force
+                    or (CFG.vm_watch and now - (a.get("vm_observed_at") or 0) >= 850)
                     or not last_ka
                     or ((now - last_ka) > 6 * 3600 and
                         (not exp_at or exp_at - now < 36 * 3600 or
@@ -2552,7 +2642,7 @@ async def run_keepalive_all(force: bool = False) -> dict:
             KEEPALIVE_STATE["running"] = False
 
 
-def _warmup_browser_sync():
+def _warmup_browser_sync(account_id=None):
     """后台静默预热浏览器与首个可用账号的 WebSocket 隧道，使重启后首条请求也秒回。"""
     if getattr(engine, "current_acc_id", None) and engine.page is not None:
         return
@@ -2560,12 +2650,17 @@ def _warmup_browser_sync():
         return
     acc = None
     try:
-        acc = ACCOUNT_POOL.acquire(rotate=False, timeout=0.1, record_use=False)
+        acc = ACCOUNT_POOL.acquire(account_id=account_id, rotate=False, timeout=0.1, record_use=False)
         log.info("【浏览器预热】正在后台预热账号 %s (%s) 的热备标签页...", acc.get("label"), acc["id"])
         _bind_account_proxy(acc)
         refreshed = _renew_and_persist(acc["id"], wake_vm=True, force=False) or acc
         engine.start()
+        if CFG.warm_chat:
+            engine.take_warm_page(acc["id"])
         engine.ensure_page(refreshed["cookies"], refreshed.get("cookies_exp"), account_id=acc["id"])
+        if CFG.warm_chat:
+            engine.clean_chat_page()
+            engine.park_warm_page(acc["id"])
         log.info("【浏览器预热】账号 %s (%s) 热备标签页与 WebSocket 已就绪", acc.get("label"), acc["id"])
     except Exception as exc:  # noqa: BLE001
         log.warning("【浏览器预热】预热异常: %s", exc)
@@ -2583,11 +2678,12 @@ async def _keepalive_loop():
     log.info("【自动保活守护进程】已启动，检测周期: 15 分钟")
     await asyncio.sleep(1)
     try:
-        await asyncio.to_thread(_check_update_sync, True)
-    except Exception:
-        pass
-    try:
-        await asyncio.to_thread(_warmup_browser_sync)
+        if CFG.warm_chat:
+            for account in store.list_accounts():
+                if account.get("enabled", True):
+                    await asyncio.to_thread(_warmup_browser_sync, account["id"])
+        else:
+            await asyncio.to_thread(_warmup_browser_sync)
     except Exception as e:  # noqa: BLE001
         log.warning("【浏览器预热】异常: %s", e)
     while True:

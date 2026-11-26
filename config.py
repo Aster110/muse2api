@@ -104,6 +104,11 @@ class Config:
     chat_timeout: int = field(default_factory=lambda: int(_env("MUSE2API_CHAT_TIMEOUT", "300")))
     max_concurrency: int = field(default_factory=lambda: max(1, int(_env("MUSE2API_CONCURRENCY", "8"))))
 
+    warm_chat: bool = field(default_factory=lambda: _env("MUSE2API_WARM_CHAT", "0") == "1")
+    media_per_account: int = field(default_factory=lambda: min(2, max(1, int(_env("MUSE2API_MEDIA_PER_ACCOUNT", "1")))))
+    vm_watch: bool = field(default_factory=lambda: _env("MUSE2API_VM_WATCH", "0") == "1")
+    vm_notify: str = field(default_factory=lambda: _env("MUSE2API_VM_NOTIFY", ""))
+
     # 参考图输入默认只允许调用方直接提供数据和公网 URL。
     # 仅可信单用户部署可显式设为 1 恢复服务器本地文件或私网抓取。
     ref_image_local_files: bool = field(

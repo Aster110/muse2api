@@ -26,14 +26,15 @@ class CDP:
             self._id += 1
             mid = self._id
             self.ws.send(json.dumps({"id": mid, "method": method, "params": params or {}}))
-            deadline = time.time() + (timeout or self.timeout)
-            while time.time() < deadline:
+            deadline = time.monotonic() + (timeout or self.timeout)
+            while time.monotonic() < deadline:
+                self.ws.settimeout(max(0.01, deadline - time.monotonic()))
                 try:
                     msg = json.loads(self.ws.recv())
                 except websocket.WebSocketTimeoutException:
                     continue
-                except Exception:  # noqa: BLE001
-                    continue
+                except (websocket.WebSocketConnectionClosedException, OSError):
+                    raise
                 if msg.get("id") == mid:
                     if "error" in msg:
                         raise CDPError(f"{method}: {msg['error']}")
